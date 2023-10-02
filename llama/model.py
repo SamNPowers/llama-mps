@@ -16,6 +16,9 @@ from fairscale.nn.model_parallel.layers import (
 from torch import nn
 device = torch.device('mps') if torch.backends.mps.is_available() else torch.device('cpu')
 
+from llama.visualizer import AttentionVisualizer
+
+
 @dataclass
 class ModelArgs:
     dim: int = 4096
@@ -87,7 +90,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, verbose=False):
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         model_parallel_size = fs_init.get_model_parallel_world_size()
@@ -95,6 +98,8 @@ class Attention(nn.Module):
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
+        self._verbose = verbose
+        self.attention_visualizer = AttentionVisualizer()
 
         self.wq = ColumnParallelLinear(
             args.dim,
@@ -128,16 +133,33 @@ class Attention(nn.Module):
         self.cache_k = torch.zeros(
             (
                 args.max_batch_size,
-                args.max_seq_len,
                 self.n_local_kv_heads,
                 self.head_dim,
+                args.max_seq_len,
             )
         ).to(device)
         self.cache_v = torch.zeros(
             (
                 args.max_batch_size,
-                args.max_seq_len,
                 self.n_local_kv_heads,
+                args.max_seq_len,
+                self.head_dim,
+            )
+        ).to(device)
+
+        self.latest_compressed_k = torch.zeros(
+            (
+                args.max_batch_size,
+                self.n_local_kv_heads,
+                self.head_dim,
+                1,
+            )
+        ).to(device)
+        self.latest_compressed_v = torch.zeros(
+            (
+                args.max_batch_size,
+                self.n_local_kv_heads,
+                1,
                 self.head_dim,
             )
         ).to(device)
@@ -149,38 +171,79 @@ class Attention(nn.Module):
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
+        #print("a1")
         bsz, seqlen, _ = x.shape
+        #breakpoint()
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        #print(f"a2: seqlen: {seqlen}, x shape: {x.shape}, xq shape: {xq.shape}")
 
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        #print(f"a3. Freqs shape: {freqs_cis.shape}")
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        #print("a4")
 
-        self.cache_k = self.cache_k.to(xq)
-        self.cache_v = self.cache_v.to(xq)
-
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
-
-        keys = self.cache_k[:bsz, : start_pos + seqlen]
-        values = self.cache_v[:bsz, : start_pos + seqlen]
+        # TODO spowers: testing...
+        #self.cache_k = self.cache_k.to(xq)
+        #self.cache_v = self.cache_v.to(xq)
 
         # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(keys, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-        values = repeat_kv(values, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        #breakpoint()
+        xk = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        xv = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
 
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys = keys.transpose(1, 2)
-        values = values.transpose(1, 2)
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        xk = xk.transpose(1, 2)
+        xk = xk.transpose(2, 3)
+        xv = xv.transpose(1, 2)
+
+        self.cache_k[:bsz, :, :, start_pos : start_pos + seqlen] = xk
+        self.cache_v[:bsz, :, start_pos : start_pos + seqlen] = xv
+        #print("a5")
+
+        keys = self.cache_k[:bsz, :, :, : start_pos + seqlen]
+        values = self.cache_v[:bsz, :, : start_pos + seqlen]
+        #print("a6")
+
+        #xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        #keys = keys.transpose(1, 2)
+        #values = values.transpose(1, 2)
+
+        #scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        scores = torch.matmul(xq, keys) / math.sqrt(self.head_dim)
         if mask is not None:
+            #print(f"Mask shape: {mask.shape}, score shape: {scores.shape}")
+            #breakpoint()
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+
+        # TODO: spowers. Experimenting with compressing the keys and values (weighted averages by score). Very naive exploration
+        self.latest_compressed_k[:bsz] = torch.matmul(scores, keys.transpose(2, 3)).transpose(2, 3)[:, :, :, -1:]
+        self.latest_compressed_v[:bsz] = output[:, :, -1:, :]
+
+        self.attention_visualizer.add_scores(scores)
+
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+
+        if False and self._verbose:
+            print(f"Keys: {keys}")
+            #print(f"scores: {scores}")
+            #print(f"output: {output}")
+            #print(f"wo: {self.wo(output)}")
+
+        #print("a-end")
         return self.wo(output)
+
+    def compress_cache(self):
+        self.cache_k[:, :, :, 0:1] = self.latest_compressed_k
+        self.cache_v[:, :, 0:1, :] = self.latest_compressed_v
+
+        # Returns cache_len
+        # TODO spowers: should be an instance variable, instead of piped out and back in, but...lazy/prototyping
+        return 1
 
 
 class FeedForward(nn.Module):
@@ -213,12 +276,12 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, layer_id: int, args: ModelArgs):
+    def __init__(self, layer_id: int, args: ModelArgs, verbose=False):
         super().__init__()
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
-        self.attention = Attention(args)
+        self.attention = Attention(args, verbose=verbose)
         self.feed_forward = FeedForward(
             dim=args.dim,
             hidden_dim=4 * args.dim,
@@ -242,6 +305,9 @@ class TransformerBlock(nn.Module):
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
 
+    def compress_cache(self):
+        return self.attention.compress_cache()
+
 
 class Transformer(nn.Module):
     def __init__(self, params: ModelArgs):
@@ -256,7 +322,7 @@ class Transformer(nn.Module):
 
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
-            self.layers.append(TransformerBlock(layer_id, params))
+            self.layers.append(TransformerBlock(layer_id, params, verbose=layer_id == 0))
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = ColumnParallelLinear(
@@ -272,12 +338,14 @@ class Transformer(nn.Module):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         #self.freqs_cis = self.freqs_cis.to(h.device)
+        #breakpoint()
+        #print(f"bsz: {_bsz}, seqlen: {seqlen}, start_pos: {start_pos}")
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
         mask = None
         if seqlen > 1:
             mask = torch.full(
-                (1, 1, seqlen, seqlen), float("-inf"), device='cpu'
+                (1, 1, seqlen, seqlen + start_pos), float("-inf"), device='cpu'  # TODO: spowers check
             )
             mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
 
@@ -286,3 +354,12 @@ class Transformer(nn.Module):
         h = self.norm(h)
         output = self.output(h).float()
         return output
+
+    def compress_cache(self):
+        cache_len = None
+        for layer in self.layers:
+            layer_cache_len = layer.compress_cache()
+            assert cache_len is None or cache_len == layer_cache_len, "Layers should (for now?) have identical cache_lens"
+            cache_len = layer_cache_len
+
+        return cache_len

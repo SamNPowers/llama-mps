@@ -6,6 +6,8 @@ from typing import Optional
 import fire
 
 from llama import Llama
+import time
+from torch.profiler import profile, record_function, ProfilerActivity
 
 
 def main(
@@ -16,14 +18,22 @@ def main(
     max_seq_len: int = 512,
     max_batch_size: int = 8,
     max_gen_len: Optional[int] = None,
-    weights_in_float16: Optional[bool] = False
+    weights_in_float16: Optional[bool] = False,
 ):
+    cache_responses = True
+    pass_full_dialog = not cache_responses
+    compress_cache = True
+
+    print(f"max_seq_len: {max_seq_len} \n max_batch_size: {max_batch_size} \n max_gen_len: {max_gen_len} \n cache_responses: {cache_responses} \n pass_full_dialog: {pass_full_dialog} \n compress_cache: {compress_cache}")
+
     generator = Llama.build(
         ckpt_dir=ckpt_dir,
         tokenizer_path=tokenizer_path,
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
-        weights_in_float16=weights_in_float16
+        weights_in_float16=weights_in_float16,
+        cache_responses=cache_responses,
+        compress_cache=compress_cache
     )
 
     dialogs = [
@@ -71,7 +81,42 @@ If a question does not make any sense, or is not factually coherent, explain why
             }
         ],
     ]
-    results = [generator.chat_completion(
+
+    dialog_info = []
+
+    while True:
+        dialog_user_text = input("Human response: ")
+
+        if not pass_full_dialog:
+            dialog_info.clear()
+
+        dialog_info.append({'role': 'user', 'content': dialog_user_text})
+
+        start_time = time.time()
+        #with profile(activities=[ProfilerActivity.CPU], with_modules=True) as prof:
+        #    with record_function("model_inference"):
+        result = generator.chat_completion(
+            [dialog_info],  # type: ignore
+            max_gen_len=max_gen_len,
+            temperature=temperature,
+            top_p=top_p,
+            logprobs=True
+        )
+        #print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+        end_time = time.time()
+        print(f"{len(result[0]['tokens'])/(end_time - start_time)} t/s")
+
+        for msg in dialog_info:
+            print(f"{msg['role'].capitalize()}: {msg['content']}\n")
+
+        ai_response = result[0]['generation']
+        dialog_info.append(ai_response)
+        print(
+            f"> {ai_response['role'].capitalize()}: {ai_response['content']}"
+        )
+        print("\n==================================\n")
+
+    """results = [generator.chat_completion(
         [d],  # type: ignore
         max_gen_len=max_gen_len,
         temperature=temperature,
@@ -84,8 +129,9 @@ If a question does not make any sense, or is not factually coherent, explain why
         print(
             f"> {result[0]['generation']['role'].capitalize()}: {result[0]['generation']['content']}"
         )
-        print("\n==================================\n")
+        print("\n==================================\n")"""
 
 
 if __name__ == "__main__":
+    # TODO: note: when debugging in PyCharm, on left side of debug pane > Settings > Variables Loading Policy > Synchronous
     fire.Fire(main)

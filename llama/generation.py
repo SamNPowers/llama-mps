@@ -56,6 +56,8 @@ class Llama:
         max_batch_size: int,
         model_parallel_size: Optional[int] = None,
         weights_in_float16: Optional[bool] = False,
+        cache_responses: Optional[bool] = False,
+        compress_cache: Optional[bool] = False,
     ) -> "Llama":
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group("gloo")
@@ -95,13 +97,25 @@ class Llama:
         model = Transformer(model_args)
         model.load_state_dict(checkpoint, strict=False)
         model = model.to(device)
-        print(f"Loaded in {time.time() - start_time:.2f} seconds")
+        ##print(f"Loaded in {time.time() - start_time:.2f} seconds")
 
-        return Llama(model, tokenizer)
+        return Llama(model, tokenizer, cache_responses=cache_responses, compress_cache=compress_cache)
 
-    def __init__(self, model: Transformer, tokenizer: Tokenizer):
+    def __init__(self, model: Transformer, tokenizer: Tokenizer, cache_responses, compress_cache):
         self.model = model
         self.tokenizer = tokenizer
+        self._cache_responses = cache_responses
+        self._compress_cache = compress_cache
+
+        # This allows us to continue the conversation without needing to re-process prior text
+        # It *does* mean that the agent is stateful, so separate Llama agents will need to be created per conversation
+        self._previous_pos_marker = 0  # TODO: better/clearer name
+
+    def _add_tokens_for_viz(self, new_tokens):
+        # TODO: putting this here to be minimally invasive during testing. If I choose to keep this, pipe through better
+        text_tokens = [[self.tokenizer.decode(tok.item() if isinstance(tok, torch.Tensor) else tok) for tok in batch_prompt] for batch_prompt in new_tokens]
+        for layer in self.model.layers:
+            layer.attention.attention_visualizer.add_tokens(text_tokens)
 
     @torch.inference_mode()
     def generate(
@@ -115,7 +129,10 @@ class Llama:
     ) -> Tuple[List[List[int]], Optional[List[List[float]]]]:
         params = self.model.params
         bsz = len(prompt_tokens)
+        #print(f"Bsz: {bsz}")
         assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
+
+        self._add_tokens_for_viz(prompt_tokens)
 
         min_prompt_len = min(len(t) for t in prompt_tokens)
         max_prompt_len = max(len(t) for t in prompt_tokens)
@@ -133,7 +150,13 @@ class Llama:
         eos_reached = torch.tensor([False] * bsz, device=device)
         input_text_mask = tokens != pad_id
         for cur_pos in range(min_prompt_len, total_len):
-            logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            #breakpoint()
+            ##print(f"Min prompt length: {min_prompt_len}")
+            model_start = prev_pos if not self._cache_responses else prev_pos + self._previous_pos_marker
+            print(f"Model_start: {model_start}")
+            #print("a")
+            logits = self.model.forward(tokens[:, prev_pos:cur_pos], model_start)
+            #print("b")
             if logprobs:
                 token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
                     input=logits.transpose(1, 2),
@@ -141,6 +164,7 @@ class Llama:
                     reduction="none",
                     ignore_index=pad_id,
                 )
+            #print("c")
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
                 next_token = sample_top_p(probs, top_p)
@@ -157,8 +181,19 @@ class Llama:
                 next_token == self.tokenizer.eos_id
             )
             prev_pos = cur_pos
+
+            self._add_tokens_for_viz(next_token.unsqueeze(-1))
+            #print(f"eos: {eos_reached}")
             if all(eos_reached):
+                ##print(f"EOS reached: {cur_pos}")
                 break
+
+        # TODO: this only "saves" after a dialogue string is finished. Better to cache partway in the event of failure?
+        # Or allow for resets by killing in the middle?
+        self._previous_pos_marker += prev_pos
+
+        if self._compress_cache:
+            self._previous_pos_marker = self.model.compress_cache()
 
         if logprobs:
             token_logprobs = token_logprobs.tolist()
